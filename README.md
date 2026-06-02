@@ -1,23 +1,22 @@
-# Nuvio Arabic Subtitles Addon
+# SubDL Arabic Subtitles Addon
 
 This is a tiny Stremio-compatible subtitles addon for Nuvio.
 
-It proxies OpenSubtitles v3 and returns only Arabic subtitle results.
-It can also query SubDL directly, including subtitle packs that are returned as `.zip` files.
+It uses the official SubDL API at `https://api.subdl.com/api/v1/subtitles` and returns Arabic subtitle results.
 When a subtitle download is zipped, the addon extracts the first supported subtitle file and serves it directly to Stremio/Nuvio.
 
 ## SubDL ZIP Fix
 
 SubDL sometimes stores subtitles inside ZIP packs. Those results may not appear or may fail in Stremio/Nuvio if the app receives the ZIP file directly.
 
-To include those results, create a SubDL API key and set:
+Create a SubDL API key from `https://subdl.com/` and set:
 
 ```text
 SUBDL_API_KEY=your-subdl-api-key
 SUBDL_LANGUAGES=ar
 ```
 
-The addon requests SubDL with `unpack=1`, so full-season packs can expose their saved episode subtitle files. If SubDL still returns a ZIP download link, this addon proxies the link and extracts `.srt`, `.vtt`, `.ass`, `.ssa`, or `.sub` files before sending them to the player.
+The addon requests SubDL with `full_season=1` and `unpack=1`, so full-season packs can expose their saved episode subtitle files. If SubDL still returns a ZIP download link, this addon proxies the link and extracts `.srt`, `.vtt`, `.ass`, `.ssa`, or `.sub` files before sending them to the player.
 
 ## Install URL
 
@@ -76,14 +75,14 @@ Optional environment variables:
 
 ```text
 PORT=7000
-UPSTREAM_BASE=https://opensubtitles-v3.strem.io
 SUBDL_API_KEY=
 SUBDL_LANGUAGES=ar
 MAX_SUBTITLES=0
 USE_CUSTOM_LANGUAGE_LABELS=false
 DEBUG_REQUESTS=false
-PROXY_SUBTITLE_DOWNLOADS=true
 SUBTITLE_PROXY_SECRET=
+SUBDL_TIMEOUT_MS=10000
+SUBTITLE_DOWNLOAD_TIMEOUT_MS=15000
 MAX_ARCHIVE_BYTES=15728640
 MAX_EXTRACTED_SUBTITLE_BYTES=4194304
 ```
@@ -93,3 +92,45 @@ MAX_EXTRACTED_SUBTITLE_BYTES=4194304
 Set `DEBUG_REQUESTS=true` temporarily on Render to see whether Nuvio sends the selected stream filename in subtitle requests.
 
 Set `SUBTITLE_PROXY_SECRET` on hosted deployments if you want subtitle proxy links to stay valid across restarts.
+
+## Troubleshooting
+
+First open:
+
+```text
+https://YOUR-DOMAIN/health
+```
+
+It should show:
+
+```json
+{
+  "ok": true,
+  "source": "subdl",
+  "subdlApiKeyConfigured": true,
+  "subdlLanguages": "ar"
+}
+```
+
+If `subdlApiKeyConfigured` is `false`, set `SUBDL_API_KEY` in Render and redeploy.
+
+To test a movie directly:
+
+```text
+https://YOUR-DOMAIN/debug/subdl/movie/tt1375666.json
+```
+
+To test a series episode directly:
+
+```text
+https://YOUR-DOMAIN/debug/subdl/series/tt0944947:1:1.json
+```
+
+Check `subtitleCount`, `unpackFileCount`, and `mappedSubtitleCount`.
+
+- `mappedSubtitleCount > 0`: the addon found subtitles and Stremio should show them.
+- `subtitleCount > 0` but `mappedSubtitleCount = 0`: SubDL returned records, but none had usable download URLs for this request.
+- `subtitleCount = 0`: SubDL did not return Arabic subtitles for that IMDb/episode.
+- `ok = false`: read the `error` field. It usually means the API key is missing, invalid, rate-limited, or the request timed out.
+
+Render free services can sleep. The first request after sleep may be slow while Render wakes the service. After it wakes, subtitle requests should be faster. If Stremio times out often, use a paid always-on service or keep the `/health` endpoint warm.

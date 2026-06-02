@@ -4,10 +4,8 @@ const zlib = require("node:zlib");
 
 const PORT = Number(process.env.PORT || 7000);
 const HOST = process.env.HOST || "0.0.0.0";
-const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || "https://opensubtitles-v3.strem.io").replace(/\/+$/, "");
 const USE_CUSTOM_LANGUAGE_LABELS = process.env.USE_CUSTOM_LANGUAGE_LABELS === "true";
 const DEBUG_REQUESTS = process.env.DEBUG_REQUESTS === "true";
-const PROXY_SUBTITLE_DOWNLOADS = process.env.PROXY_SUBTITLE_DOWNLOADS !== "false";
 const SUBTITLE_PROXY_SECRET = process.env.SUBTITLE_PROXY_SECRET || crypto.randomBytes(32).toString("hex");
 const SUBDL_API_KEY = String(process.env.SUBDL_API_KEY || "").trim();
 const SUBDL_LANGUAGES = String(process.env.SUBDL_LANGUAGES || "ar").trim();
@@ -22,16 +20,23 @@ const MAX_EXTRACTED_SUBTITLE_BYTES =
   Number.isFinite(parsedMaxExtractedSubtitleBytes) && parsedMaxExtractedSubtitleBytes > 0
     ? Math.floor(parsedMaxExtractedSubtitleBytes)
     : 4 * 1024 * 1024;
+const parsedSubdlTimeoutMs = Number(process.env.SUBDL_TIMEOUT_MS || 10000);
+const SUBDL_TIMEOUT_MS =
+  Number.isFinite(parsedSubdlTimeoutMs) && parsedSubdlTimeoutMs > 0 ? Math.floor(parsedSubdlTimeoutMs) : 10000;
+const parsedSubtitleDownloadTimeoutMs = Number(process.env.SUBTITLE_DOWNLOAD_TIMEOUT_MS || 15000);
+const SUBTITLE_DOWNLOAD_TIMEOUT_MS =
+  Number.isFinite(parsedSubtitleDownloadTimeoutMs) && parsedSubtitleDownloadTimeoutMs > 0
+    ? Math.floor(parsedSubtitleDownloadTimeoutMs)
+    : 15000;
 
 const MANIFEST = {
-  id: "community.opensubtitles-v3.arabic-only",
-  version: "1.0.3",
-  name: "Arabic Subtitles",
-  description: "Arabic subtitle results with optional SubDL support and ZIP archive extraction.",
+  id: "community.subdl.arabic-zip",
+  version: "1.0.5",
+  name: "SubDL Arabic Subtitles",
+  description: "Arabic subtitles from the official SubDL API with ZIP archive extraction support.",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
-  logo: "http://www.strem.io/images/addons/opensubtitles-logo.png",
   catalogs: [],
   behaviorHints: {
     configurable: false,
@@ -82,82 +87,14 @@ function sendBuffer(res, status, buffer, contentType, extraHeaders = {}) {
   res.end(buffer);
 }
 
-function normalizeLanguage(value) {
+function safeHeaderValue(value, maxLength = 200) {
   return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_.-]+/g, "");
-}
-
-function hasArabicWord(value) {
-  const text = String(value || "").toLowerCase();
-  return text.includes("arabic") || text.includes("\u0627\u0644\u0639\u0631\u0628\u064a\u0629") || text.includes("\u0639\u0631\u0628\u064a");
-}
-
-function hasArabicCode(value) {
-  const normalized = normalizeLanguage(value);
-  if (["ar", "ara", "arab"].includes(normalized)) {
-    return true;
-  }
-
-  const text = String(value || "").toLowerCase();
-  return /(^|[^a-z])(ar|ara)([^a-z]|$)/.test(text);
-}
-
-function isArabicSubtitle(subtitle) {
-  if (!subtitle || typeof subtitle !== "object") {
-    return false;
-  }
-
-  const languageFields = [
-    subtitle.lang,
-    subtitle.language,
-    subtitle.languageCode,
-    subtitle.langCode,
-    subtitle.iso_639_1,
-    subtitle.iso_639_2,
-    subtitle.iso639,
-    subtitle.sub_lang,
-    subtitle.subtitleLanguage
-  ];
-
-  if (languageFields.some((value) => hasArabicCode(value) || hasArabicWord(value))) {
-    return true;
-  }
-
-  const labelFields = [subtitle.name, subtitle.title, subtitle.label, subtitle.id];
-  return labelFields.some((value) => hasArabicWord(value));
+    .replace(/[\r\n]/g, " ")
+    .slice(0, maxLength);
 }
 
 function firstText(values) {
   return values.find((value) => typeof value === "string" && value.trim().length > 0);
-}
-
-function getSubtitleDisplayName(subtitle, index) {
-  const releaseName = firstText([
-    subtitle.name,
-    subtitle.title,
-    subtitle.label,
-    subtitle.filename,
-    subtitle.fileName,
-    subtitle.MovieReleaseName,
-    subtitle.release,
-    subtitle.releaseName
-  ]);
-
-  if (releaseName) {
-    return `Arabic #${index + 1} - ${releaseName.trim()}`;
-  }
-
-  const details = [];
-  if (subtitle.id) {
-    details.push(`ID ${subtitle.id}`);
-  }
-  if (subtitle.SubEncoding) {
-    details.push(String(subtitle.SubEncoding));
-  }
-
-  return [`Arabic #${index + 1}`, ...details].join(" - ");
 }
 
 function toBase64Url(value) {
@@ -193,7 +130,7 @@ function resolveSubtitleUrl(value) {
   }
 
   try {
-    const url = new URL(value.trim(), UPSTREAM_BASE);
+    const url = new URL(value.trim());
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       return null;
     }
@@ -203,45 +140,21 @@ function resolveSubtitleUrl(value) {
   }
 }
 
-function createSubtitleProxyUrl(req, subtitleUrl) {
+function sanitizeSubtitleFileName(value) {
+  const cleanName = String(value || "")
+    .split(/[\\/]/)
+    .pop()
+    .replace(/[^a-z0-9._ -]/gi, "_")
+    .replace(/_+/g, "_")
+    .trim();
+
+  return cleanName || "subtitle.srt";
+}
+
+function createSubtitleProxyUrl(req, subtitleUrl, fileName = "subtitle.srt") {
   const payload = toBase64Url(subtitleUrl);
   const signature = signPayload(payload);
-  return `${getBaseUrl(req)}/subtitle-proxy/${payload}.${signature}`;
-}
-
-function getSubtitleDownloadUrl(subtitle) {
-  return resolveSubtitleUrl(
-    firstText([
-      subtitle.url,
-      subtitle.SubDownloadLink,
-      subtitle.downloadLink,
-      subtitle.downloadUrl,
-      subtitle.link,
-      subtitle.href
-    ])
-  );
-}
-
-function prepareSubtitleForNuvio(req, subtitle, index) {
-  const name = getSubtitleDisplayName(subtitle, index);
-  const prepared = {
-    ...subtitle,
-    lang: USE_CUSTOM_LANGUAGE_LABELS ? name : "ara",
-    language: "Arabic",
-    languageCode: "ara",
-    iso_639_2: "ara",
-    name,
-    title: name
-  };
-
-  if (PROXY_SUBTITLE_DOWNLOADS) {
-    const subtitleUrl = getSubtitleDownloadUrl(subtitle);
-    if (subtitleUrl) {
-      prepared.url = createSubtitleProxyUrl(req, subtitleUrl);
-    }
-  }
-
-  return prepared;
+  return `${getBaseUrl(req)}/subtitle-proxy/${payload}.${signature}/${encodeURIComponent(sanitizeSubtitleFileName(fileName))}`;
 }
 
 function getTextForReleaseDetection(values) {
@@ -279,6 +192,7 @@ function getSubtitleReleaseText(subtitle) {
     subtitle.MovieReleaseName,
     subtitle.release,
     subtitle.releaseName,
+    subtitle.release_name,
     subtitle.id
   ]);
 }
@@ -332,7 +246,7 @@ function getSubtitleRequestInfo(req) {
   }
 
   const stremioType = decodeURIComponent(match[1]);
-  const id = decodeURIComponent(match[2]);
+  const id = decodeURIComponent(match[2].split("/")[0]);
   const idParts = id.split(":");
   const imdbId = idParts.find((part) => /^tt\d+$/i.test(part));
   if (!imdbId) {
@@ -372,6 +286,37 @@ function buildSubdlSearchUrl(requestInfo) {
   }
 
   return url.href;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function redactSubdlUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.searchParams.has("api_key")) {
+      url.searchParams.set("api_key", SUBDL_API_KEY ? "[configured]" : "[missing]");
+    }
+    return url.href;
+  } catch (error) {
+    return String(value || "");
+  }
 }
 
 function resolveSubdlDownloadUrl(value) {
@@ -419,6 +364,25 @@ function getSubdlReleaseName(subtitle, unpackedFile) {
   ]);
 }
 
+function getSubdlSubtitleFileName(subtitle, unpackedFile) {
+  const name = firstText([
+    unpackedFile && unpackedFile.name,
+    unpackedFile && unpackedFile.release_name,
+    subtitle.name,
+    subtitle.release_name,
+    subtitle.filename
+  ]);
+  const format = firstText([unpackedFile && unpackedFile.format, subtitle.format]);
+  const fallback = format ? `subtitle.${String(format).replace(/^\./, "")}` : "subtitle.srt";
+  const fileName = sanitizeSubtitleFileName(name || fallback);
+
+  if (/\.(srt|vtt|ass|ssa|sub)$/i.test(fileName)) {
+    return fileName;
+  }
+
+  return `${fileName}.${String(format || "srt").replace(/^\./, "")}`;
+}
+
 function createSubdlSubtitle(req, subtitle, index, requestInfo, unpackedFile = null) {
   const url = resolveSubdlDownloadUrl(unpackedFile ? unpackedFile.url : subtitle.url);
   if (!url) {
@@ -440,7 +404,7 @@ function createSubdlSubtitle(req, subtitle, index, requestInfo, unpackedFile = n
     iso_639_2: "ara",
     name,
     title: name,
-    url: createSubtitleProxyUrl(req, url)
+    url: createSubtitleProxyUrl(req, url, getSubdlSubtitleFileName(subtitle, unpackedFile))
   };
 }
 
@@ -473,21 +437,25 @@ function mapSubdlResponseToSubtitles(req, requestInfo, payload) {
 }
 
 async function fetchSubdlSubtitles(req) {
-  if (!SUBDL_API_KEY || !SUBDL_LANGUAGES) {
-    return [];
+  if (!SUBDL_API_KEY) {
+    throw new Error("SUBDL_API_KEY is not configured.");
+  }
+
+  if (!SUBDL_LANGUAGES) {
+    throw new Error("SUBDL_LANGUAGES is not configured.");
   }
 
   const requestInfo = getSubtitleRequestInfo(req);
   if (!requestInfo) {
-    return [];
+    throw new Error("Could not parse a Stremio IMDb id from the subtitles request.");
   }
 
-  const response = await fetch(buildSubdlSearchUrl(requestInfo), {
+  const response = await fetchWithTimeout(buildSubdlSearchUrl(requestInfo), {
     headers: {
       "accept": "application/json",
       "user-agent": "nuvio-arabic-subtitles-addon/1.0"
     }
-  });
+  }, SUBDL_TIMEOUT_MS);
 
   const text = await response.text();
   if (!response.ok) {
@@ -506,6 +474,73 @@ async function fetchSubdlSubtitles(req) {
   }
 
   return mapSubdlResponseToSubtitles(req, requestInfo, payload);
+}
+
+async function getSubdlDebugInfo(req, subtitlePath) {
+  const debugReq = {
+    ...req,
+    url: subtitlePath
+  };
+  const requestInfo = getSubtitleRequestInfo(debugReq);
+  if (!requestInfo) {
+    throw new Error("Could not parse the debug subtitles path.");
+  }
+  if (!SUBDL_API_KEY) {
+    throw new Error("SUBDL_API_KEY is not configured in this service.");
+  }
+
+  const url = buildSubdlSearchUrl(requestInfo);
+  const startedAt = Date.now();
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "accept": "application/json",
+      "user-agent": "nuvio-arabic-subtitles-addon/1.0"
+    }
+  }, SUBDL_TIMEOUT_MS);
+  const text = await response.text();
+  const durationMs = Date.now() - startedAt;
+  let payload = null;
+
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`SubDL response was not JSON: ${text.slice(0, 200)}`);
+  }
+
+  const subtitles = Array.isArray(payload.subtitles) ? payload.subtitles : [];
+  const mapped = mapSubdlResponseToSubtitles(debugReq, requestInfo, payload);
+  const unpackFileCount = subtitles.reduce(
+    (count, subtitle) => count + (Array.isArray(subtitle.unpack_files) ? subtitle.unpack_files.length : 0),
+    0
+  );
+
+  return {
+    ok: response.ok && payload.status !== false,
+    requestInfo,
+    subdlRequestUrl: redactSubdlUrl(url),
+    subdlStatusCode: response.status,
+    subdlDurationMs: durationMs,
+    subdlPayloadStatus: payload.status,
+    subdlError: payload.error || null,
+    resultCount: Array.isArray(payload.results) ? payload.results.length : 0,
+    subtitleCount: subtitles.length,
+    unpackFileCount,
+    mappedSubtitleCount: mapped.length,
+    sampleMappedSubtitles: mapped.slice(0, 5).map((subtitle) => ({
+      id: subtitle.id,
+      lang: subtitle.lang,
+      name: subtitle.name,
+      hasProxyUrl: Boolean(subtitle.url)
+    })),
+    sampleRawSubtitles: subtitles.slice(0, 3).map((subtitle) => ({
+      name: subtitle.name || null,
+      release_name: subtitle.release_name || null,
+      season: subtitle.season || null,
+      episode: subtitle.episode || null,
+      url: subtitle.url || null,
+      unpack_files: Array.isArray(subtitle.unpack_files) ? subtitle.unpack_files.length : 0
+    }))
+  };
 }
 
 function isZipBuffer(buffer) {
@@ -533,6 +568,14 @@ function getSubtitleContentType(fileName) {
     return "text/plain";
   }
   return "application/x-subrip";
+}
+
+function getSubtitleContentTypeFromUrl(url) {
+  try {
+    return getSubtitleContentType(new URL(url).pathname);
+  } catch (error) {
+    return "application/x-subrip";
+  }
 }
 
 function getSubtitleExtensionPriority(fileName) {
@@ -670,7 +713,7 @@ function extractSubtitleFromZip(buffer) {
 }
 
 function parseProxyPath(path) {
-  const token = decodeURIComponent(path.slice("/subtitle-proxy/".length));
+  const token = decodeURIComponent(path.slice("/subtitle-proxy/".length).split("/")[0]);
   const separatorIndex = token.lastIndexOf(".");
   if (separatorIndex < 1) {
     return null;
@@ -710,12 +753,12 @@ async function handleSubtitleProxy(req, res, path) {
     return;
   }
 
-  const upstream = await fetch(subtitleUrl, {
+  const upstream = await fetchWithTimeout(subtitleUrl, {
     headers: {
       "accept": "application/zip,text/vtt,text/plain,*/*",
       "user-agent": "nuvio-arabic-subtitles-addon/1.0"
     }
-  });
+  }, SUBTITLE_DOWNLOAD_TIMEOUT_MS);
 
   const buffer = await readResponseBuffer(upstream);
   if (!upstream.ok) {
@@ -725,7 +768,8 @@ async function handleSubtitleProxy(req, res, path) {
 
   const contentType = upstream.headers.get("content-type") || "application/octet-stream";
   if (!isZipResponse(subtitleUrl, contentType.toLowerCase(), buffer)) {
-    sendBuffer(res, 200, buffer, contentType, { "cache-control": "public, max-age=86400" });
+    const playerContentType = contentType === "application/octet-stream" ? getSubtitleContentTypeFromUrl(subtitleUrl) : contentType;
+    sendBuffer(res, 200, buffer, playerContentType, { "cache-control": "public, max-age=86400" });
     return;
   }
 
@@ -738,71 +782,64 @@ async function handleSubtitleProxy(req, res, path) {
 }
 
 async function handleSubtitles(req, res) {
-  const upstreamUrl = `${UPSTREAM_BASE}${req.url}`;
-  const upstream = await fetch(upstreamUrl, {
-    headers: {
-      "accept": "application/json",
-      "user-agent": "nuvio-arabic-subtitles-addon/1.0"
-    }
-  });
-
-  const text = await upstream.text();
-  if (!upstream.ok) {
-    sendText(res, upstream.status, text || `Upstream returned ${upstream.status}`);
-    return;
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch (error) {
-    sendJson(res, 502, {
-      subtitles: [],
-      error: "Upstream response was not JSON."
-    });
-    return;
-  }
-
-  const subtitles = Array.isArray(payload.subtitles) ? payload.subtitles : [];
-  logSubtitleRequest(req, subtitles);
-  const upstreamArabicSubtitles = sortByRequestRelease(req, subtitles.filter(isArabicSubtitle)).map((subtitle, index) =>
-    prepareSubtitleForNuvio(req, subtitle, index)
-  );
   let subdlSubtitles = [];
+  let subdlError = "";
 
   try {
     subdlSubtitles = await fetchSubdlSubtitles(req);
   } catch (error) {
+    subdlError = error instanceof Error ? error.message : String(error);
     if (DEBUG_REQUESTS) {
       console.log(
         JSON.stringify({
           event: "subdl-error",
           url: decodeURIComponent(req.url),
-          error: error instanceof Error ? error.message : String(error)
+          error: subdlError
         })
       );
     }
   }
 
-  const arabicSubtitles = applySubtitleLimit([...subdlSubtitles, ...upstreamArabicSubtitles]);
+  logSubtitleRequest(req, subdlSubtitles);
+  const arabicSubtitles = applySubtitleLimit(sortByRequestRelease(req, subdlSubtitles));
 
   sendJson(
     res,
     200,
     {
-      ...payload,
       subtitles: arabicSubtitles
     },
     {
       "cache-control": "public, max-age=300",
-      "x-upstream-subtitles": String(subtitles.length),
+      "x-subtitle-source": "subdl",
       "x-subdl-subtitles": String(subdlSubtitles.length),
       "x-arabic-subtitles": String(arabicSubtitles.length),
       "x-max-subtitles": String(MAX_SUBTITLES),
-      "x-proxy-subtitle-downloads": String(PROXY_SUBTITLE_DOWNLOADS),
-      "x-subdl-enabled": String(Boolean(SUBDL_API_KEY))
+      "x-subdl-enabled": String(Boolean(SUBDL_API_KEY)),
+      "x-subdl-error": safeHeaderValue(subdlError)
     }
   );
+}
+
+async function handleDebugSubdl(req, res, path) {
+  const subtitlePath = path.replace(/^\/debug\/subdl/i, "/subtitles").replace(/\.json$/i, "");
+  const normalizedPath = `${subtitlePath}.json`;
+
+  try {
+    const info = await getSubdlDebugInfo(req, normalizedPath);
+    sendJson(res, 200, {
+      ...info,
+      subdlApiKeyConfigured: Boolean(SUBDL_API_KEY),
+      subdlLanguages: SUBDL_LANGUAGES
+    });
+  } catch (error) {
+    sendJson(res, 200, {
+      ok: false,
+      subdlApiKeyConfigured: Boolean(SUBDL_API_KEY),
+      subdlLanguages: SUBDL_LANGUAGES,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -826,7 +863,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === "/health") {
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, {
+        ok: true,
+        source: "subdl",
+        subdlApiKeyConfigured: Boolean(SUBDL_API_KEY),
+        subdlLanguages: SUBDL_LANGUAGES
+      });
       return;
     }
 
@@ -837,6 +879,11 @@ const server = http.createServer(async (req, res) => {
 
     if (path.startsWith("/subtitles/")) {
       await handleSubtitles(req, res);
+      return;
+    }
+
+    if (path.startsWith("/debug/subdl/")) {
+      await handleDebugSubdl(req, res, path);
       return;
     }
 
@@ -856,5 +903,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Arabic subtitles addon listening on http://localhost:${PORT}/manifest.json`);
-  console.log(`Proxying subtitles from ${UPSTREAM_BASE}`);
+  console.log(`Using official SubDL API from ${SUBDL_API_BASE}`);
 });
