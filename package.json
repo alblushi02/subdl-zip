@@ -1,0 +1,13 @@
+{
+  "name": "nuvio-arabic-subtitles-addon",
+  "version": "1.0.0",
+  "description": "A Stremio/Nuvio subtitles addon proxy that keeps only Arabic subtitles from OpenSubtitles v3.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

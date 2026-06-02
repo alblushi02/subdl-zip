@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: nuvio-arabic-subtitles-addon
+    env: node
+    plan: free
+    buildCommand: ""
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: UPSTREAM_BASE
+        value: https://opensubtitles-v3.strem.io
+      - key: SUBDL_API_KEY
+        sync: false
+      - key: SUBDL_LANGUAGES
+        value: ar
+      - key: MAX_SUBTITLES
+        value: 0
+      - key: PROXY_SUBTITLE_DOWNLOADS
+        value: true
+      - key: SUBTITLE_PROXY_SECRET
+        generateValue: true
